@@ -1,0 +1,11 @@
+pub mod cli;
+pub mod commands;
+pub mod detection;
+pub mod error;
+pub mod identity;
+pub mod inspection;
+pub mod output;
+pub mod registry;
+pub mod runtime;
+pub mod state;
+pub mod supabase;
