@@ -499,8 +499,15 @@ fn portable_ps_process_start(
 }
 
 fn process_group_exists(group: Pid) -> Result<bool, RuntimeError> {
-    match test_kill_process_group(group) {
-        Ok(()) => Ok(true),
+    classify_process_group_probe(group, test_kill_process_group(group))
+}
+
+fn classify_process_group_probe(
+    group: Pid,
+    result: Result<(), Errno>,
+) -> Result<bool, RuntimeError> {
+    match result {
+        Ok(()) | Err(Errno::PERM) => Ok(true),
         Err(Errno::SRCH) => Ok(false),
         Err(source) => Err(RuntimeError::InspectProcessGroup {
             pid: u32::try_from(group.as_raw_pid()).unwrap_or_default(),
@@ -605,6 +612,16 @@ pub enum RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_denied_group_probe_still_means_the_group_exists() {
+        let group = pid_from_u32(42).expect("valid process group");
+
+        assert!(
+            classify_process_group_probe(group, Err(Errno::PERM))
+                .expect("EPERM proves the process group exists")
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
