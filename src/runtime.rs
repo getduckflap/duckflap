@@ -158,7 +158,8 @@ pub(crate) fn spawn_gated_with_stdio(
     }
     let helper = env::current_exe().map_err(RuntimeError::CurrentExecutable)?;
     let exec_error_path = log_path.with_extension("exec-error");
-    let mut child = Command::new(&helper)
+    let mut command = Command::new(&helper);
+    command
         .arg("__gated-exec")
         .arg("--executable")
         .arg(program)
@@ -172,13 +173,25 @@ pub(crate) fn spawn_gated_with_stdio(
         .envs(environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
-        .process_group(0)
-        .spawn()
-        .map_err(|source| RuntimeError::LaunchGate {
-            helper: helper.clone(),
-            source,
-        })?;
+        .stderr(Stdio::from(stderr));
+    // A session boundary keeps the managed process group isolated from the
+    // launcher's job-control session. The helper is not yet a group leader, so
+    // setsid makes its PID both the session ID and process group ID.
+    // SAFETY: setsid is async-signal-safe, and the closure only invokes setsid
+    // and reads errno before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().map_err(|source| RuntimeError::LaunchGate {
+        helper: helper.clone(),
+        source,
+    })?;
 
     let gate = match child.stdin.take() {
         Some(gate) => gate,
