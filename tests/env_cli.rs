@@ -4024,7 +4024,7 @@ fn detached_run_preserves_a_runtime_during_a_transient_readiness_drop() {
         }"#,
     );
     let script = format!(
-        "#!/bin/sh\nexec python3 - \"$PORT\" \"{}\" \"{}\" \"{}\" <<'PY'\nimport socket\nimport sys\nimport time\nfrom pathlib import Path\n\ndef listen(port):\n    listener = socket.socket()\n    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    listener.bind((\"127.0.0.1\", port))\n    listener.listen()\n    return listener\n\nport = int(sys.argv[1])\ndrop_trigger = Path(sys.argv[2])\ndropped_marker = Path(sys.argv[3])\nrecover_trigger = Path(sys.argv[4])\nlistener = listen(port)\nif not dropped_marker.exists():\n    while not drop_trigger.exists():\n        time.sleep(0.01)\n    listener.close()\n    dropped_marker.touch()\n    while not recover_trigger.exists():\n        time.sleep(0.01)\n    listener = listen(port)\ntime.sleep(30)\nPY\n",
+        "#!/bin/sh\nexec python3 - \"$PORT\" \"{}\" \"{}\" \"{}\" <<'PY'\nimport socket\nimport sys\nimport threading\nimport time\nfrom pathlib import Path\n\ndef drain(listener):\n    while True:\n        try:\n            connection, _ = listener.accept()\n        except socket.timeout:\n            continue\n        except OSError:\n            return\n        connection.close()\n\ndef listen(port):\n    listener = socket.socket()\n    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    listener.bind((\"127.0.0.1\", port))\n    listener.listen()\n    listener.settimeout(0.05)\n    threading.Thread(target=drain, args=(listener,), daemon=True).start()\n    return listener\n\nport = int(sys.argv[1])\ndrop_trigger = Path(sys.argv[2])\ndropped_marker = Path(sys.argv[3])\nrecover_trigger = Path(sys.argv[4])\nlistener = listen(port)\nif not dropped_marker.exists():\n    while not drop_trigger.exists():\n        time.sleep(0.01)\n    listener.close()\n    dropped_marker.touch()\n    while not recover_trigger.exists():\n        time.sleep(0.01)\n    listener = listen(port)\ntime.sleep(30)\nPY\n",
         drop_trigger.display(),
         dropped_marker.display(),
         recover_trigger.display(),
@@ -4054,6 +4054,7 @@ fn detached_run_preserves_a_runtime_during_a_transient_readiness_drop() {
         "repeated run did not confirm sustained readiness loss"
     );
     fs::write(&recover_trigger, []).expect("restore listener");
+    wait_for_tcp_port(port, true);
 
     let repeated = repeated.wait_with_output().expect("wait for repeated run");
     assert!(repeated.status.success(), "{repeated:?}");
@@ -4062,7 +4063,6 @@ fn detached_run_preserves_a_runtime_during_a_transient_readiness_drop() {
     assert_eq!(repeated_json["changed"], false);
     assert_eq!(repeated_json["data"]["runtime_session_id"], first_session);
     assert_eq!(repeated_json["data"]["services"][0]["port"], port);
-    wait_for_tcp_port(port, true);
 
     let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
     let session_count = connection

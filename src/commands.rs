@@ -36,7 +36,7 @@ use crate::{
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_READINESS_STABILITY: Duration = Duration::from_secs(2);
-const LOST_READINESS_STABILITY: Duration = Duration::from_millis(250);
+const LOST_READINESS_STABILITY: Duration = Duration::from_secs(1);
 const RUNTIME_CONVERGENCE_ATTEMPTS: usize = 6;
 const PREVIOUS_TERMINAL_SESSIONS_TO_KEEP: u32 = 3;
 
@@ -912,20 +912,23 @@ fn resolve_existing_runtime(
         }
         "ready" => {
             if !runtime_matches_detection(&session, detected)? {
-                return stop_existing_runtime(state_paths, &stored, &session, owner);
+                return stop_existing_runtime(state_paths, &stored, &session, owner, false);
             }
             if runtime_session_is_ready(&stored, &session)? {
                 return Ok(ExistingRuntime::Ready(run_data_from_stored(
                     &stored, &session,
                 )?));
             }
-            thread::sleep(LOST_READINESS_STABILITY);
-            if runtime_session_is_ready(&stored, &session)? {
-                return Ok(ExistingRuntime::Ready(run_data_from_stored(
-                    &stored, &session,
-                )?));
+            let deadline = Instant::now() + LOST_READINESS_STABILITY;
+            while Instant::now() < deadline {
+                thread::sleep(RUNTIME_POLL_INTERVAL);
+                if runtime_session_is_ready(&stored, &session)? {
+                    return Ok(ExistingRuntime::Ready(run_data_from_stored(
+                        &stored, &session,
+                    )?));
+                }
             }
-            stop_existing_runtime(state_paths, &stored, &session, owner)
+            stop_existing_runtime(state_paths, &stored, &session, owner, true)
         }
         status => Err(AppError::InvalidRuntimeStatus(status.to_owned()).into()),
     }
@@ -936,10 +939,28 @@ fn stop_existing_runtime(
     stored: &StoredProjectInstance,
     session: &StoredRuntimeSession,
     owner: &ProcessIdentity,
+    recheck_readiness: bool,
 ) -> Result<ExistingRuntime, CommandFailure> {
     let mut registry = Registry::open_mutating(state_paths)
         .map_err(AppError::from)
         .map_err(CommandFailure::from)?;
+    if recheck_readiness {
+        let Some(current) = registry
+            .find_active_runtime(stored.project_instance_id)
+            .map_err(AppError::from)
+            .map_err(CommandFailure::from)?
+        else {
+            return Ok(ExistingRuntime::Retry { changed: false });
+        };
+        if current.id != session.id || current.status != "ready" {
+            return Ok(ExistingRuntime::Retry { changed: false });
+        }
+        if runtime_session_is_ready(stored, &current)? {
+            return Ok(ExistingRuntime::Ready(run_data_from_stored(
+                stored, &current,
+            )?));
+        }
+    }
     let Some(claim) = registry
         .claim_runtime_stop_if_current(
             stored.project_instance_id,
