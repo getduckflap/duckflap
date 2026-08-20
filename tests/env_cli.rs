@@ -2145,6 +2145,17 @@ fn detached_run_is_ready_idempotent_and_stoppable() {
 
     let first = run_detached(&repo, &state);
     let _cleanup = RuntimeCleanup::new(&repo, &state);
+    if !first.status.success() {
+        let processes = Command::new("ps")
+            .args(["-axo", "pid=,ppid=,pgid=,sid=,uid=,euid=,stat=,command="])
+            .output()
+            .expect("inspect process groups after failed detached run");
+        eprintln!(
+            "detached run diagnostic (test pid={}):\n{}",
+            std::process::id(),
+            String::from_utf8_lossy(&processes.stdout)
+        );
+    }
     assert!(first.status.success(), "{first:?}");
     assert!(first.stderr.is_empty(), "stderr was not empty: {first:?}");
     let first_json: Value = serde_json::from_slice(&first.stdout).expect("parse run response");
