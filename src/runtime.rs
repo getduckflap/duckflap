@@ -158,8 +158,7 @@ pub(crate) fn spawn_gated_with_stdio(
     }
     let helper = env::current_exe().map_err(RuntimeError::CurrentExecutable)?;
     let exec_error_path = log_path.with_extension("exec-error");
-    let mut command = Command::new(&helper);
-    command
+    let mut child = Command::new(&helper)
         .arg("__gated-exec")
         .arg("--executable")
         .arg(program)
@@ -173,25 +172,13 @@ pub(crate) fn spawn_gated_with_stdio(
         .envs(environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr));
-    // A session boundary keeps the managed process group isolated from the
-    // launcher's job-control session. The helper is not yet a group leader, so
-    // setsid makes its PID both the session ID and process group ID.
-    // SAFETY: setsid is async-signal-safe, and the closure only invokes setsid
-    // and reads errno before exec.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut child = command.spawn().map_err(|source| RuntimeError::LaunchGate {
-        helper: helper.clone(),
-        source,
-    })?;
+        .stderr(Stdio::from(stderr))
+        .process_group(0)
+        .spawn()
+        .map_err(|source| RuntimeError::LaunchGate {
+            helper: helper.clone(),
+            source,
+        })?;
 
     let gate = match child.stdin.take() {
         Some(gate) => gate,
@@ -441,6 +428,17 @@ fn parse_linux_start_ticks(stat: &str) -> io::Result<&str> {
 
 #[cfg(target_os = "macos")]
 fn macos_process_start(pid: Pid) -> Result<Option<String>, RuntimeError> {
+    let Some(info) = macos_process_info(pid)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "macos-v1:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_info(pid: Pid) -> Result<Option<libc::proc_bsdinfo>, RuntimeError> {
     let buffer_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .expect("proc_bsdinfo fits in a C integer");
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -476,10 +474,7 @@ fn macos_process_start(pid: Pid) -> Result<Option<String>, RuntimeError> {
             "macOS returned an identity for a different process",
         )));
     }
-    Ok(Some(format!(
-        "macos-v1:{}:{}",
-        info.pbi_start_tvsec, info.pbi_start_tvusec
-    )))
+    Ok(Some(info))
 }
 
 fn legacy_process_start(pid: Pid) -> Result<Option<String>, RuntimeError> {
@@ -512,15 +507,9 @@ fn portable_ps_process_start(
 }
 
 fn process_group_exists(group: Pid) -> Result<bool, RuntimeError> {
-    classify_process_group_probe(group, test_kill_process_group(group))
-}
-
-fn classify_process_group_probe(
-    group: Pid,
-    result: Result<(), Errno>,
-) -> Result<bool, RuntimeError> {
-    match result {
-        Ok(()) | Err(Errno::PERM) => Ok(true),
+    match test_kill_process_group(group) {
+        Ok(()) => Ok(true),
+        Err(Errno::PERM) => permission_denied_process_group_exists(group),
         Err(Errno::SRCH) => Ok(false),
         Err(source) => Err(RuntimeError::InspectProcessGroup {
             pid: u32::try_from(group.as_raw_pid()).unwrap_or_default(),
@@ -529,48 +518,66 @@ fn classify_process_group_probe(
     }
 }
 
-fn signal_group(group: Pid, signal: Signal) -> Result<(), RuntimeError> {
-    match kill_process_group(group, signal) {
-        Ok(()) | Err(Errno::SRCH) => Ok(()),
-        Err(source) => {
-            #[cfg(target_os = "macos")]
-            eprintln!("{}", macos_process_group_diagnostic(group, signal, source));
-            Err(RuntimeError::SignalProcessGroup {
-                process_group_id: u32::try_from(group.as_raw_pid()).unwrap_or_default(),
-                source,
-            })
-        }
-    }
+#[cfg(not(target_os = "macos"))]
+fn permission_denied_process_group_exists(_group: Pid) -> Result<bool, RuntimeError> {
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_group_diagnostic(group: Pid, signal: Signal, source: Errno) -> String {
-    let group_id = group.as_raw_pid().to_string();
-    let members = Command::new("/bin/ps")
-        .env("LC_ALL", "C")
-        .args(["-axo", "pid=,ppid=,pgid=,sid=,uid=,euid=,stat=,command="])
-        .output()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| line.split_whitespace().nth(2) == Some(group_id.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_else(|error| format!("failed to inspect process table: {error}"));
-    // SAFETY: These process identity queries have no preconditions.
-    let (uid, euid, caller_group, caller_session) = unsafe {
-        (
-            libc::getuid(),
-            libc::geteuid(),
-            libc::getpgid(0),
-            libc::getsid(0),
-        )
+fn permission_denied_process_group_exists(group: Pid) -> Result<bool, RuntimeError> {
+    let pid_size = std::mem::size_of::<libc::pid_t>();
+    // macOS 26 reports EPERM when a process group contains only zombies. Those
+    // processes are already dead, but any non-zombie member keeps EPERM genuine.
+    // SAFETY: __error returns this thread's writable errno slot.
+    unsafe { *libc::__error() = 0 };
+    // SAFETY: A null buffer asks libproc for the required PID capacity.
+    let required = unsafe { libc::proc_listpgrppids(group.as_raw_pid(), std::ptr::null_mut(), 0) };
+    if required <= 0 {
+        let source = io::Error::last_os_error();
+        return match source.raw_os_error() {
+            Some(0) if required == 0 => Ok(false),
+            _ => Err(RuntimeError::InspectProcess(source)),
+        };
+    }
+    let required = usize::try_from(required).expect("libproc returned a positive PID count");
+    let mut pids = vec![0; required + 1];
+    let buffer_size = i32::try_from(pids.len() * pid_size).expect("PID buffer fits in a C integer");
+    // SAFETY: __error returns this thread's writable errno slot.
+    unsafe { *libc::__error() = 0 };
+    // SAFETY: The buffer is writable for buffer_size bytes and contains pid_t values.
+    let written = unsafe {
+        libc::proc_listpgrppids(group.as_raw_pid(), pids.as_mut_ptr().cast(), buffer_size)
     };
-    format!(
-        "duckflap macOS signal diagnostic: caller_pid={} uid={uid} euid={euid} pgid={caller_group} sid={caller_session}; target_pgid={group_id} signal={signal:?} error={source}; target members:\n{members}",
-        process::id(),
-    )
+    if written <= 0 {
+        let source = io::Error::last_os_error();
+        return match source.raw_os_error() {
+            Some(0) if written == 0 => Ok(false),
+            _ => Err(RuntimeError::InspectProcess(source)),
+        };
+    }
+    let written = usize::try_from(written).expect("libproc returned a nonnegative PID count");
+    if written == pids.len() {
+        return Ok(true);
+    }
+    for raw_pid in pids.into_iter().take(written) {
+        let Some(pid) = Pid::from_raw(raw_pid) else {
+            continue;
+        };
+        if macos_process_info(pid)?.is_some_and(|info| info.pbi_status != libc::SZOMB) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn signal_group(group: Pid, signal: Signal) -> Result<(), RuntimeError> {
+    match kill_process_group(group, signal) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(source) => Err(RuntimeError::SignalProcessGroup {
+            process_group_id: u32::try_from(group.as_raw_pid()).unwrap_or_default(),
+            source,
+        }),
+    }
 }
 
 fn wait_for_group_exit(group: Pid, timeout: Duration) -> Result<bool, RuntimeError> {
@@ -660,12 +667,13 @@ pub enum RuntimeError {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn permission_denied_group_probe_still_means_the_group_exists() {
         let group = pid_from_u32(42).expect("valid process group");
 
         assert!(
-            classify_process_group_probe(group, Err(Errno::PERM))
+            permission_denied_process_group_exists(group)
                 .expect("EPERM proves the process group exists")
         );
     }

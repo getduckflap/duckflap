@@ -22,6 +22,15 @@ use serde_json::Value;
 use tempfile::tempdir;
 
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+const FAKE_TCP_LISTENER: &str = r#"exec python3 -c 'import os
+import socket
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", int(os.environ["PORT"])))
+listener.listen()
+while True:
+    connection, _ = listener.accept()
+    connection.close()'"#;
 
 #[test]
 fn env_json_is_stable_and_leaves_the_worktree_clean() {
@@ -2306,7 +2315,7 @@ fn wait_observes_a_runtime_that_becomes_ready_later() {
     );
     install_fake_next_script(
         &repo,
-        "#!/bin/sh\nsleep 0.2\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
+        &format!("#!/bin/sh\nsleep 0.2\n{FAKE_TCP_LISTENER}\n"),
     );
 
     let starting = run_detached_command(&repo, &state)
@@ -2437,10 +2446,7 @@ fn wait_times_out_without_changing_a_starting_runtime() {
             "scripts": { "dev": "next dev" }
         }"#,
     );
-    install_fake_next_script(
-        &repo,
-        "#!/bin/sh\nsleep 5\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
-    );
+    install_fake_next_script(&repo, &format!("#!/bin/sh\nsleep 5\n{FAKE_TCP_LISTENER}\n"));
 
     let starting = run_detached_command(&repo, &state)
         .stdout(Stdio::piped())
@@ -2719,10 +2725,7 @@ fn concurrent_runs_converge_during_a_delayed_successful_startup() {
             "scripts": { "dev": "next dev" }
         }"#,
     );
-    install_fake_next_script(
-        &repo,
-        "#!/bin/sh\nsleep 4\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
-    );
+    install_fake_next_script(&repo, &format!("#!/bin/sh\nsleep 4\n{FAKE_TCP_LISTENER}\n"));
 
     let first = run_detached_command(&repo, &state)
         .stdout(Stdio::piped())
@@ -3108,7 +3111,7 @@ fn logs_remain_available_after_runtime_stop() {
     );
     install_fake_next_script(
         &repo,
-        "#!/bin/sh\nprintf 'started web runtime\\n' >&2\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
+        &format!("#!/bin/sh\nprintf 'started web runtime\\n' >&2\n{FAKE_TCP_LISTENER}\n"),
     );
     let started = run_detached(&repo, &state);
     let _cleanup = RuntimeCleanup::new(&repo, &state);
@@ -3160,7 +3163,9 @@ fn stop_owns_nextjs_after_its_launcher_dies_during_gated_startup() {
     );
     install_fake_next_script(
         &repo,
-        "#!/bin/sh\n: > \"$DUCKFLAP_FAKE_NEXT_ENTERED\"\nwhile [ ! -e \"$DUCKFLAP_FAKE_NEXT_CONTINUE\" ]; do sleep 0.01; done\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
+        &format!(
+            "#!/bin/sh\n: > \"$DUCKFLAP_FAKE_NEXT_ENTERED\"\nwhile [ ! -e \"$DUCKFLAP_FAKE_NEXT_CONTINUE\" ]; do sleep 0.01; done\n{FAKE_TCP_LISTENER}\n"
+        ),
     );
     let environment = run_env(&repo, &state);
     assert!(environment.status.success(), "{environment:?}");
@@ -3657,10 +3662,7 @@ fn stop_can_claim_a_runtime_that_has_spawned_but_is_still_starting() {
             "scripts": { "dev": "next dev" }
         }"#,
     );
-    install_fake_next_script(
-        &repo,
-        "#!/bin/sh\nsleep 2\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
-    );
+    install_fake_next_script(&repo, &format!("#!/bin/sh\nsleep 2\n{FAKE_TCP_LISTENER}\n"));
 
     let running = run_detached_command(&repo, &state)
         .stdout(Stdio::piped())
@@ -5357,10 +5359,7 @@ fn update_package_json(repo: &Path, package_json: &str) {
 }
 
 fn install_fake_next(repo: &Path) {
-    install_fake_next_script(
-        repo,
-        "#!/bin/sh\nexec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
-    );
+    install_fake_next_script(repo, &format!("#!/bin/sh\n{FAKE_TCP_LISTENER}\n"));
 }
 
 fn install_fake_next_script(repo: &Path, script: &str) {

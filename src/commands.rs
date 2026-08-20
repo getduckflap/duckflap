@@ -1139,15 +1139,6 @@ fn start_web_component(
             .map_err(AppError::from)
             .map_err(|error| CommandFailure::new(error, changed))?
         {
-            #[cfg(target_os = "macos")]
-            eprintln!(
-                "duckflap macOS startup diagnostic: runtime pid={} pgid={} exited before readiness with status={status}; snapshot={}; log={}",
-                stored_process.pid,
-                stored_process.process_group_id,
-                macos_runtime_start_snapshot(stored_process.pid, service.port),
-                fs::read_to_string(&stored_process.log_path)
-                    .unwrap_or_else(|error| format!("<failed to read log: {error}>")),
-            );
             terminate_recorded_process_group(&stored_process, session.id, changed)?;
             if let Some(source) = spawned
                 .take_exec_error()
@@ -1182,16 +1173,6 @@ fn start_web_component(
             ready_since = None;
         }
         if Instant::now() >= deadline {
-            #[cfg(target_os = "macos")]
-            eprintln!(
-                "duckflap macOS startup diagnostic: runtime pid={} pgid={} timed out waiting for port {}; snapshot={}; log={}",
-                stored_process.pid,
-                stored_process.process_group_id,
-                service.port,
-                macos_runtime_start_snapshot(stored_process.pid, service.port),
-                fs::read_to_string(&stored_process.log_path)
-                    .unwrap_or_else(|error| format!("<failed to read log: {error}>")),
-            );
             terminate_recorded_process_group(&stored_process, session.id, changed)?;
             let _ = spawned.child.wait();
             return Err(CommandFailure::new(
@@ -1204,27 +1185,6 @@ fn start_web_component(
         }
         thread::sleep(RUNTIME_POLL_INTERVAL);
     }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_runtime_start_snapshot(pid: u32, port: u16) -> String {
-    let process = ProcessCommand::new("/bin/ps")
-        .env("LC_ALL", "C")
-        .args([
-            "-o",
-            "pid=,ppid=,pgid=,sid=,uid=,euid=,stat=,command=",
-            "-p",
-        ])
-        .arg(pid.to_string())
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_else(|error| format!("<failed to inspect process: {error}>"));
-    let address = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port);
-    let connection =
-        std::net::TcpStream::connect_timeout(&address.into(), Duration::from_millis(100))
-            .map(|_| "connected".to_owned())
-            .unwrap_or_else(|error| format!("failed: {error}"));
-    format!("process=[{process}] loopback_connect={connection}")
 }
 
 fn start_supabase_component(
