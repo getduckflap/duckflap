@@ -20,6 +20,7 @@ use duckflap::{
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use tempfile::tempdir;
+use uuid::Uuid;
 
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 const FAKE_TCP_LISTENER: &str = r#"exec python3 -c 'import os
@@ -2903,6 +2904,474 @@ fn logs_searches_history_for_the_latest_matching_service() {
 }
 
 #[test]
+fn new_run_keeps_three_previous_terminal_sessions_and_prunes_older_history() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next_script(
+        &repo,
+        "#!/bin/sh\nprintf 'newest runtime log\\n' >&2\nexit 1\n",
+    );
+    let environment = run_env(&repo, &state);
+    assert!(environment.status.success(), "{environment:?}");
+    let environment_json: Value =
+        serde_json::from_slice(&environment.stdout).expect("parse environment");
+    let project_instance_id = environment_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let seeded = (0..5)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let runtime_sentinel = state.join("runtimes/sentinel/keep.txt");
+    fs::create_dir_all(runtime_sentinel.parent().expect("runtime sentinel parent"))
+        .expect("create runtime sentinel directory");
+    fs::write(&runtime_sentinel, "keep runtime data\n").expect("write runtime sentinel");
+
+    let run = run_detached(&repo, &state);
+    assert!(!run.status.success(), "{run:?}");
+
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    let retained = connection
+        .prepare(
+            "SELECT id FROM runtime_sessions
+             WHERE project_instance_id = ?1 AND status IN ('stopped', 'failed')
+             ORDER BY rowid DESC",
+        )
+        .expect("prepare retained session query")
+        .query_map([project_instance_id], |row| row.get::<_, String>(0))
+        .expect("query retained sessions")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect retained sessions");
+    assert_eq!(retained.len(), 4);
+    for (session_id, session_path) in &seeded[..2] {
+        assert!(!retained.contains(&session_id.to_string()));
+        assert!(!session_path.exists());
+    }
+    for (session_id, session_path) in &seeded[2..] {
+        assert!(retained.contains(&session_id.to_string()));
+        assert!(session_path.is_dir());
+    }
+    assert_eq!(
+        fs::read_to_string(&runtime_sentinel).expect("read retained runtime sentinel"),
+        "keep runtime data\n"
+    );
+
+    let logs = run_logs(&repo, &state, "web", 20);
+    assert!(logs.status.success(), "{logs:?}");
+    assert_eq!(logs.stdout, b"newest runtime log\n");
+}
+
+#[test]
+fn repeated_healthy_run_does_not_prune_terminal_history() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next(&repo);
+    let started = run_detached(&repo, &state);
+    let _cleanup = RuntimeCleanup::new(&repo, &state);
+    assert!(started.status.success(), "{started:?}");
+    let started_json: Value = serde_json::from_slice(&started.stdout).expect("parse started run");
+    let project_instance_id = started_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let seeded = (0..4)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let repeated = run_detached(&repo, &state);
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated_json: Value =
+        serde_json::from_slice(&repeated.stdout).expect("parse repeated run");
+    assert_eq!(repeated_json["changed"], false);
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_sessions
+                 WHERE project_instance_id = ?1 AND status IN ('stopped', 'failed')",
+                [project_instance_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count unpruned terminal history"),
+        4
+    );
+    assert!(seeded.iter().all(|(_, path)| path.is_dir()));
+}
+
+#[test]
+fn terminal_history_cleanup_validates_every_candidate_before_removing_anything() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next_script(&repo, "#!/bin/sh\nexit 1\n");
+    let environment = run_env(&repo, &state);
+    assert!(environment.status.success(), "{environment:?}");
+    let environment_json: Value =
+        serde_json::from_slice(&environment.stdout).expect("parse environment");
+    let project_instance_id = environment_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let seeded = (0..5)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let backing = state.join("symlinked-session-backing");
+    fs::rename(&seeded[0].1, &backing).expect("move oldest session directory");
+    std::os::unix::fs::symlink(&backing, &seeded[0].1).expect("symlink oldest session directory");
+
+    let run = run_detached(&repo, &state);
+    assert!(!run.status.success(), "{run:?}");
+    let response: Value = serde_json::from_slice(&run.stdout).expect("parse cleanup error");
+    assert_eq!(response["changed"], false);
+    assert_eq!(response["error"]["code"], "UNSAFE_SESSION_HISTORY_PATH");
+    assert!(seeded[1].1.is_dir());
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_sessions WHERE project_instance_id = ?1",
+                [project_instance_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count unchanged sessions"),
+        5
+    );
+}
+
+#[test]
+fn terminal_history_cleanup_reports_partial_mutation_and_retries_missing_directories() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next_script(&repo, "#!/bin/sh\nexit 1\n");
+    let environment = run_env(&repo, &state);
+    assert!(environment.status.success(), "{environment:?}");
+    let environment_json: Value =
+        serde_json::from_slice(&environment.stdout).expect("parse environment");
+    let project_instance_id = environment_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let seeded = (0..4)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal_history_delete
+             BEFORE DELETE ON runtime_sessions
+             BEGIN
+                 SELECT RAISE(ABORT, 'blocked terminal history deletion');
+             END;",
+        )
+        .expect("install deletion failure trigger");
+
+    let blocked = run_detached(&repo, &state);
+    assert!(!blocked.status.success(), "{blocked:?}");
+    let blocked_json: Value = serde_json::from_slice(&blocked.stdout).expect("parse blocked run");
+    assert_eq!(blocked_json["changed"], true);
+    assert_eq!(blocked_json["error"]["code"], "REGISTRY_ERROR");
+    assert!(!seeded[0].1.exists());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_sessions WHERE project_instance_id = ?1",
+                [project_instance_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count sessions after blocked deletion"),
+        4
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER reject_terminal_history_delete;")
+        .expect("remove deletion failure trigger");
+    drop(connection);
+    let retried = run_detached(&repo, &state);
+    assert!(!retried.status.success(), "{retried:?}");
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("reopen registry");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_sessions WHERE project_instance_id = ?1",
+                [project_instance_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count sessions after retry"),
+        4
+    );
+}
+
+#[test]
+fn post_housekeeping_claim_failure_reports_changed_true() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next_script(&repo, "#!/bin/sh\nexit 1\n");
+    let environment = run_env(&repo, &state);
+    assert!(environment.status.success(), "{environment:?}");
+    let environment_json: Value =
+        serde_json::from_slice(&environment.stdout).expect("parse environment");
+    let project_instance_id = environment_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let seeded = (0..4)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_runtime_claim
+             BEFORE INSERT ON runtime_sessions
+             WHEN NEW.status = 'starting'
+             BEGIN
+                 SELECT RAISE(ABORT, 'blocked runtime claim');
+             END;",
+        )
+        .expect("install claim failure trigger");
+
+    let run = run_detached(&repo, &state);
+    assert!(!run.status.success(), "{run:?}");
+    let response: Value = serde_json::from_slice(&run.stdout).expect("parse claim failure");
+    assert_eq!(response["changed"], true);
+    assert_eq!(response["error"]["code"], "REGISTRY_ERROR");
+    assert!(!seeded[0].1.exists());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_sessions WHERE project_instance_id = ?1",
+                [project_instance_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count retained sessions after claim failure"),
+        3
+    );
+}
+
+#[test]
+fn post_housekeeping_retry_error_reports_changed_true() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next_script(&repo, "#!/bin/sh\nexit 1\n");
+    let environment = run_env(&repo, &state);
+    assert!(environment.status.success(), "{environment:?}");
+    let environment_json: Value =
+        serde_json::from_slice(&environment.stdout).expect("parse environment");
+    let project_instance_id = environment_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let seeded = (0..4)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let competing_session_id = Uuid::new_v4();
+    let owner = current_process_identity().expect("read current process identity");
+    let wrong_process_start = format!("{}-wrong", owner.process_start).replace('\'', "''");
+    let competing_log_path = state
+        .join("sessions")
+        .join(competing_session_id.to_string())
+        .join("web.log")
+        .to_string_lossy()
+        .replace('\'', "''");
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER inject_competing_runtime_after_prune
+             AFTER DELETE ON runtime_sessions
+             WHEN OLD.status = 'failed'
+             BEGIN
+                 INSERT INTO runtime_sessions
+                     (id, project_instance_id, status, launcher_pid,
+                      launcher_process_start, ready_at)
+                 VALUES
+                     ('{competing_session_id}', '{project_instance_id}', 'ready',
+                      {pid}, '{wrong_process_start}', CURRENT_TIMESTAMP);
+                 INSERT INTO runtime_processes
+                     (session_id, service_key, pid, process_group_id, process_start,
+                      executable, log_path)
+                 VALUES
+                     ('{competing_session_id}', 'web', {pid}, {pid},
+                      '{wrong_process_start}', '/bin/false', '{competing_log_path}');
+             END;",
+            pid = owner.pid,
+        ))
+        .expect("install competing runtime trigger");
+
+    let run = run_detached(&repo, &state);
+    assert!(!run.status.success(), "{run:?}");
+    let response: Value = serde_json::from_slice(&run.stdout).expect("parse retry failure");
+    assert_eq!(response["changed"], true);
+    assert_eq!(response["error"]["code"], "RUNTIME_OWNERSHIP_MISMATCH");
+    assert!(!seeded[0].1.exists());
+}
+
+#[test]
+fn replacement_retains_three_previous_terminal_sessions() {
+    let _test_lock = lock_cli_test();
+    let temp = tempdir().expect("create temp dir");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    initialize_repo(
+        &repo,
+        r#"{
+            "dependencies": { "next": "15.0.0" },
+            "scripts": { "dev": "next dev" }
+        }"#,
+    );
+    install_fake_next(&repo);
+    let started = run_detached(&repo, &state);
+    let _cleanup = RuntimeCleanup::new(&repo, &state);
+    assert!(started.status.success(), "{started:?}");
+    let started_json: Value = serde_json::from_slice(&started.stdout).expect("parse started run");
+    let project_instance_id = started_json["data"]["project_instance_id"]
+        .as_str()
+        .expect("project instance ID");
+    let first_session_id = started_json["data"]["runtime_session_id"]
+        .as_str()
+        .expect("runtime session ID");
+    let first_port = u16::try_from(
+        started_json["data"]["services"][0]["port"]
+            .as_u64()
+            .expect("runtime port"),
+    )
+    .expect("TCP port");
+    let seeded = (0..4)
+        .map(|index| {
+            seed_terminal_web_session(
+                &state,
+                project_instance_id,
+                &format!("seeded session {index}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    let process_group_id = connection
+        .query_row(
+            "SELECT process_group_id FROM runtime_processes WHERE session_id = ?1",
+            [first_session_id],
+            |row| row.get::<_, u32>(0),
+        )
+        .expect("read runtime process group");
+    drop(connection);
+    terminate_process_group(process_group_id).expect("terminate first runtime");
+    wait_for_tcp_port(first_port, false);
+
+    let replaced = run_detached(&repo, &state);
+    assert!(replaced.status.success(), "{replaced:?}");
+    let replaced_json: Value =
+        serde_json::from_slice(&replaced.stdout).expect("parse replacement run");
+    assert_ne!(
+        replaced_json["data"]["runtime_session_id"],
+        first_session_id
+    );
+
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("reopen registry");
+    let retained = connection
+        .prepare(
+            "SELECT id FROM runtime_sessions
+             WHERE project_instance_id = ?1 AND status IN ('stopped', 'failed')
+             ORDER BY rowid DESC",
+        )
+        .expect("prepare retained session query")
+        .query_map([project_instance_id], |row| row.get::<_, String>(0))
+        .expect("query retained sessions")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect retained sessions");
+    assert_eq!(retained.len(), 3);
+    assert!(retained.contains(&first_session_id.to_owned()));
+    for (session_id, session_path) in &seeded[..2] {
+        assert!(!retained.contains(&session_id.to_string()));
+        assert!(!session_path.exists());
+    }
+    for (session_id, session_path) in &seeded[2..] {
+        assert!(retained.contains(&session_id.to_string()));
+        assert!(session_path.is_dir());
+    }
+}
+
+#[test]
 fn logs_rejects_recorded_paths_outside_duckflap_state() {
     let _test_lock = lock_cli_test();
     let temp = tempdir().expect("create temp dir");
@@ -5135,6 +5604,46 @@ fn run_logs(repo: &Path, state: &Path, service: &str, tail: usize) -> Output {
         .arg(tail.to_string())
         .output()
         .expect("run duckflap logs")
+}
+
+fn seed_terminal_web_session(
+    state: &Path,
+    project_instance_id: &str,
+    contents: &str,
+) -> (Uuid, PathBuf) {
+    let session_id = Uuid::new_v4();
+    let session_path = state.join("sessions").join(session_id.to_string());
+    fs::create_dir_all(&session_path).expect("create seeded session directory");
+    let log_path = session_path.join("web.log");
+    fs::write(&log_path, contents).expect("write seeded session log");
+    let connection = Connection::open(state.join("registry.sqlite3")).expect("open registry");
+    connection
+        .execute(
+            "INSERT INTO runtime_sessions
+                (id, project_instance_id, status, launcher_pid,
+                 launcher_process_start, ended_at)
+             VALUES (?1, ?2, 'failed', 90000, ?3, CURRENT_TIMESTAMP)",
+            params![
+                session_id.to_string(),
+                project_instance_id,
+                format!("seeded-owner-{session_id}")
+            ],
+        )
+        .expect("insert seeded terminal session");
+    connection
+        .execute(
+            "INSERT INTO runtime_processes
+                (session_id, service_key, pid, process_group_id, process_start,
+                 executable, log_path)
+             VALUES (?1, 'web', 90001, 90001, ?2, '/bin/false', ?3)",
+            params![
+                session_id.to_string(),
+                format!("seeded-process-{session_id}"),
+                log_path.to_string_lossy().as_ref()
+            ],
+        )
+        .expect("insert seeded runtime process");
+    (session_id, session_path)
 }
 
 fn run_detached(repo: &Path, state: &Path) -> Output {

@@ -61,6 +61,12 @@ pub enum AppError {
     #[error("the recorded runtime log path is unsafe: {0:?}")]
     UnsafeLogPath(PathBuf),
 
+    #[error("the runtime session history path is unsafe: {0:?}")]
+    UnsafeSessionHistoryPath(PathBuf),
+
+    #[error("failed to clean runtime session history at {path:?}: {source}")]
+    CleanSessionHistory { path: PathBuf, source: io::Error },
+
     #[error("failed to read runtime log {path:?}: {source}")]
     ReadLog { path: PathBuf, source: io::Error },
 
@@ -196,6 +202,8 @@ impl AppError {
             Self::UnknownLogService { .. } => "UNKNOWN_LOG_SERVICE",
             Self::LogNotFound { .. } => "LOG_NOT_FOUND",
             Self::UnsafeLogPath(_) => "UNSAFE_LOG_PATH",
+            Self::UnsafeSessionHistoryPath(_) => "UNSAFE_SESSION_HISTORY_PATH",
+            Self::CleanSessionHistory { .. } => "SESSION_HISTORY_CLEANUP_FAILED",
             Self::ReadLog { .. } => "LOG_READ_ERROR",
             Self::MissingRuntimeProcess { .. } => "INVALID_RUNTIME_RECORD",
             Self::MissingRuntimeAdapter { .. } | Self::UnsupportedRuntimeAdapter { .. } => {

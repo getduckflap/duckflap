@@ -415,6 +415,88 @@ impl Registry {
             .transpose()
     }
 
+    pub fn terminal_runtime_sessions_to_prune(
+        &self,
+        project_instance_id: Uuid,
+        retained_sessions: u32,
+    ) -> Result<Vec<Uuid>, RegistryError> {
+        if !self.runtime_schema_available()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id
+             FROM runtime_sessions
+             WHERE project_instance_id = ?1
+               AND status IN ('stopped', 'failed')
+             ORDER BY rowid DESC
+             LIMIT -1 OFFSET ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_instance_id.to_string(),
+                    i64::from(retained_sessions)
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|session_id| Uuid::parse_str(&session_id).map_err(RegistryError::from))
+            .collect()
+    }
+
+    pub fn delete_terminal_runtime_sessions(
+        &mut self,
+        project_instance_id: Uuid,
+        session_ids: &[Uuid],
+    ) -> Result<usize, RegistryError> {
+        if session_ids.is_empty() {
+            return Ok(0);
+        }
+        let project_instance_id = project_instance_id.to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut deleted = 0;
+        for session_id in session_ids {
+            let session_id = session_id.to_string();
+            let eligible = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runtime_sessions
+                    WHERE id = ?1
+                      AND project_instance_id = ?2
+                      AND status IN ('stopped', 'failed')
+                )",
+                params![session_id, project_instance_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !eligible {
+                continue;
+            }
+            transaction.execute(
+                "DELETE FROM runtime_adapter_services WHERE session_id = ?1",
+                [&session_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM runtime_adapters WHERE session_id = ?1",
+                [&session_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM runtime_processes WHERE session_id = ?1",
+                [&session_id],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM runtime_sessions
+                 WHERE id = ?1
+                   AND project_instance_id = ?2
+                   AND status IN ('stopped', 'failed')",
+                params![session_id, project_instance_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
     pub fn claim_runtime_session(
         &mut self,
         project_instance_id: Uuid,
@@ -1915,8 +1997,9 @@ mod tests {
         thread,
     };
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use crate::{identity::GitLocation, state::StatePaths};
 
@@ -2741,6 +2824,183 @@ mod tests {
         assert_eq!(
             stored.latest_runtime.map(|session| session.status),
             Some("stopped".to_owned())
+        );
+    }
+
+    #[test]
+    fn terminal_history_candidates_and_deletion_are_scoped_and_deterministic() {
+        let temp = tempdir().expect("create temp dir");
+        let first_location = initialize_repo(&temp.path().join("first-repo"));
+        let second_location = initialize_repo(&temp.path().join("second-repo"));
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let mut registry = Registry::open_mutating(&paths).expect("open registry");
+        let first = registry
+            .ensure_project_instance(&first_location)
+            .expect("ensure first identity");
+        let second = registry
+            .ensure_project_instance(&second_location)
+            .expect("ensure second identity");
+
+        let first_sessions = (0..5)
+            .map(|index| {
+                let session_id = Uuid::new_v4();
+                registry
+                    .connection
+                    .execute(
+                        "INSERT INTO runtime_sessions
+                            (id, project_instance_id, status, launcher_pid,
+                             launcher_process_start, ended_at)
+                         VALUES (?1, ?2, 'failed', ?3, ?4, CURRENT_TIMESTAMP)",
+                        params![
+                            session_id.to_string(),
+                            first.project_instance_id.to_string(),
+                            10_000 + index,
+                            format!("first-owner-{index}")
+                        ],
+                    )
+                    .expect("insert first terminal session");
+                registry
+                    .connection
+                    .execute(
+                        "INSERT INTO runtime_processes
+                            (session_id, service_key, pid, process_group_id, process_start,
+                             executable, log_path)
+                         VALUES (?1, 'web', ?2, ?2, ?3, '/bin/false', ?4)",
+                        params![
+                            session_id.to_string(),
+                            20_000 + index,
+                            format!("process-{index}"),
+                            format!("/state/sessions/{session_id}/web.log")
+                        ],
+                    )
+                    .expect("insert first runtime process");
+                session_id
+            })
+            .collect::<Vec<_>>();
+        let other_session = Uuid::new_v4();
+        registry
+            .connection
+            .execute(
+                "INSERT INTO runtime_sessions
+                    (id, project_instance_id, status, launcher_pid,
+                     launcher_process_start, ended_at)
+                 VALUES (?1, ?2, 'failed', 30000, 'other-owner', CURRENT_TIMESTAMP)",
+                params![
+                    other_session.to_string(),
+                    second.project_instance_id.to_string()
+                ],
+            )
+            .expect("insert other terminal session");
+        let active_session = Uuid::new_v4();
+        registry
+            .connection
+            .execute(
+                "INSERT INTO runtime_sessions
+                    (id, project_instance_id, status, launcher_pid, launcher_process_start)
+                 VALUES (?1, ?2, 'starting', 40000, 'active-owner')",
+                params![
+                    active_session.to_string(),
+                    first.project_instance_id.to_string()
+                ],
+            )
+            .expect("insert active session");
+        registry
+            .connection
+            .execute(
+                "INSERT INTO runtime_adapters
+                    (session_id, adapter_key, working_directory, runtime_project_id, log_path)
+                 VALUES (?1, 'supabase', '/state/runtime', 'retained-test', ?2)",
+                params![
+                    first_sessions[0].to_string(),
+                    format!("/state/sessions/{}/supabase.log", first_sessions[0])
+                ],
+            )
+            .expect("insert terminal runtime adapter");
+        registry
+            .connection
+            .execute(
+                "INSERT INTO runtime_adapter_services
+                    (session_id, service_key, protocol, port)
+                 VALUES (?1, 'supabase.api', 'tcp', 54321)",
+                [first_sessions[0].to_string()],
+            )
+            .expect("insert terminal adapter service");
+
+        let candidates = registry
+            .terminal_runtime_sessions_to_prune(first.project_instance_id, 3)
+            .expect("select terminal history candidates");
+        assert_eq!(candidates, vec![first_sessions[1], first_sessions[0]]);
+
+        let mut requested = candidates.clone();
+        requested.push(active_session);
+        requested.push(other_session);
+        let deleted = registry
+            .delete_terminal_runtime_sessions(first.project_instance_id, &requested)
+            .expect("delete exact terminal history candidates");
+        assert_eq!(deleted, 2);
+
+        let remaining_first_terminal = registry
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_sessions
+                 WHERE project_instance_id = ?1 AND status IN ('stopped', 'failed')",
+                [first.project_instance_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count retained first sessions");
+        assert_eq!(remaining_first_terminal, 3);
+        assert!(
+            registry
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runtime_sessions WHERE id = ?1)",
+                    [active_session.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("check active session")
+        );
+        assert!(
+            registry
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runtime_sessions WHERE id = ?1)",
+                    [other_session.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("check other session")
+        );
+        for deleted_session in &first_sessions[..2] {
+            let process_exists = registry
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runtime_processes WHERE session_id = ?1)",
+                    [deleted_session.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("check deleted process");
+            assert!(!process_exists);
+        }
+        assert_eq!(
+            registry
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_adapters WHERE session_id = ?1",
+                    [first_sessions[0].to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count deleted adapters"),
+            0
+        );
+        assert_eq!(
+            registry
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_adapter_services WHERE session_id = ?1",
+                    [first_sessions[0].to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count deleted adapter services"),
+            0
         );
     }
 

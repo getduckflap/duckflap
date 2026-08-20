@@ -38,6 +38,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_READINESS_STABILITY: Duration = Duration::from_secs(2);
 const LOST_READINESS_STABILITY: Duration = Duration::from_millis(250);
 const RUNTIME_CONVERGENCE_ATTEMPTS: usize = 6;
+const PREVIOUS_TERMINAL_SESSIONS_TO_KEEP: u32 = 3;
 
 #[derive(Debug)]
 pub struct CommandSuccess<T> {
@@ -463,16 +464,20 @@ pub fn run_detached() -> Result<CommandSuccess<RunData>, CommandFailure> {
 
     for _ in 0..RUNTIME_CONVERGENCE_ATTEMPTS {
         let mut predecessor_session_id = None;
-        if let Some(stored) = load_stored_instance(&state_paths, &location)?
+        if let Some(stored) =
+            preserve_changed(load_stored_instance(&state_paths, &location), changed)?
             && let Some(session) = stored.active_runtime.clone()
         {
-            match resolve_existing_runtime(
-                &state_paths,
-                &location,
-                &detected,
-                stored,
-                session,
-                &owner,
+            match preserve_changed(
+                resolve_existing_runtime(
+                    &state_paths,
+                    &location,
+                    &detected,
+                    stored,
+                    session,
+                    &owner,
+                ),
+                changed,
             )? {
                 ExistingRuntime::Ready(data) => {
                     return Ok(CommandSuccess { changed, data });
@@ -502,8 +507,11 @@ pub fn run_detached() -> Result<CommandSuccess<RunData>, CommandFailure> {
                             crate::registry::RegistryError::EstablishedPortOccupied { .. }
                         )
                     )
-                    && load_stored_instance(&state_paths, &location)?
-                        .is_some_and(|stored| stored.active_runtime.is_some()) =>
+                    && preserve_changed(
+                        load_stored_instance(&state_paths, &location),
+                        changed,
+                    )?
+                    .is_some_and(|stored| stored.active_runtime.is_some()) =>
             {
                 continue;
             }
@@ -549,6 +557,24 @@ pub fn run_detached() -> Result<CommandSuccess<RunData>, CommandFailure> {
         let runtime_service_key = runtime_service.service_key.clone();
         let runtime_protocol = runtime_service.protocol;
         let runtime_port = runtime_service.port;
+
+        let retained_terminal_sessions = if predecessor_session_id.is_some() {
+            PREVIOUS_TERMINAL_SESSIONS_TO_KEEP - 1
+        } else {
+            PREVIOUS_TERMINAL_SESSIONS_TO_KEEP
+        };
+        match prune_terminal_runtime_history(&state_paths, &location, retained_terminal_sessions) {
+            Ok(pruned) => changed |= pruned,
+            Err(mut failure) => {
+                failure.changed |= changed;
+                return Err(abort_replacement(
+                    &state_paths,
+                    predecessor_session_id,
+                    &owner,
+                    failure,
+                ));
+            }
+        }
 
         let mut registry = match Registry::open_mutating(&state_paths) {
             Ok(registry) => registry,
@@ -620,6 +646,106 @@ pub fn run_detached() -> Result<CommandSuccess<RunData>, CommandFailure> {
     Err(CommandFailure::new(AppError::RuntimeConvergence, changed))
 }
 
+fn prune_terminal_runtime_history(
+    state_paths: &StatePaths,
+    location: &GitLocation,
+    retained_sessions: u32,
+) -> Result<bool, CommandFailure> {
+    let Some(registry) = Registry::open_observational(state_paths)
+        .map_err(AppError::from)
+        .map_err(CommandFailure::from)?
+    else {
+        return Ok(false);
+    };
+    let Some(stored) = registry
+        .find_project_instance(location)
+        .map_err(AppError::from)
+        .map_err(CommandFailure::from)?
+    else {
+        return Ok(false);
+    };
+    let candidates = registry
+        .terminal_runtime_sessions_to_prune(stored.project_instance_id, retained_sessions)
+        .map_err(AppError::from)
+        .map_err(CommandFailure::from)?;
+    drop(registry);
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let directories = validated_terminal_session_directories(state_paths, &candidates)?;
+    let mut changed = false;
+    for directory in directories {
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => changed = true,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CommandFailure::new(
+                    AppError::CleanSessionHistory {
+                        path: directory,
+                        source,
+                    },
+                    changed,
+                ));
+            }
+        }
+    }
+
+    let mut registry = Registry::open_mutating(state_paths)
+        .map_err(AppError::from)
+        .map_err(|error| CommandFailure::new(error, changed))?;
+    let deleted = registry
+        .delete_terminal_runtime_sessions(stored.project_instance_id, &candidates)
+        .map_err(AppError::from)
+        .map_err(|error| CommandFailure::new(error, changed))?;
+    Ok(changed || deleted != 0)
+}
+
+fn validated_terminal_session_directories(
+    state_paths: &StatePaths,
+    candidates: &[Uuid],
+) -> Result<Vec<PathBuf>, CommandFailure> {
+    let sessions_path = state_paths.sessions();
+    let sessions_metadata = match fs::symlink_metadata(&sessions_path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(AppError::CleanSessionHistory {
+                path: sessions_path,
+                source,
+            }
+            .into());
+        }
+    };
+    if sessions_metadata.file_type().is_symlink() || !sessions_metadata.is_dir() {
+        return Err(AppError::UnsafeSessionHistoryPath(sessions_path).into());
+    }
+
+    let mut directories = Vec::new();
+    for session_id in candidates {
+        let directory = sessions_path.join(session_id.to_string());
+        if directory.parent() != Some(sessions_path.as_path()) {
+            return Err(AppError::UnsafeSessionHistoryPath(directory).into());
+        }
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(AppError::CleanSessionHistory {
+                    path: directory,
+                    source,
+                }
+                .into());
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::UnsafeSessionHistoryPath(directory).into());
+        }
+        directories.push(directory);
+    }
+    Ok(directories)
+}
+
 fn abort_replacement(
     state_paths: &StatePaths,
     predecessor_session_id: Option<Uuid>,
@@ -647,6 +773,16 @@ fn abort_replacement(
         Ok(_) => failure,
         Err(finalization_failure) => finalization_failure,
     }
+}
+
+fn preserve_changed<T>(
+    result: Result<T, CommandFailure>,
+    changed: bool,
+) -> Result<T, CommandFailure> {
+    result.map_err(|mut failure| {
+        failure.changed |= changed;
+        failure
+    })
 }
 
 enum ExistingRuntime {

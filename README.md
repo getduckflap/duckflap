@@ -41,6 +41,8 @@ For a Supabase project, view the shared Supabase CLI log:
 duckflap logs supabase.api --tail 50
 ```
 
+Duckflap keeps logs for the latest runtime and up to three previous sessions per Git worktree. Older session history is removed automatically.
+
 Stop the stack:
 
 ```sh
