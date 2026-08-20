@@ -5436,9 +5436,19 @@ def serve(workdir):
     listeners = []
     for port in configured_ports(workdir):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", port))
         listener.listen()
         listeners.append(listener)
+    def drain(listener):
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            connection.close()
+    for listener in listeners:
+        threading.Thread(target=drain, args=(listener,), daemon=True).start()
     marker = pid_path(workdir)
     with open(marker, "w", encoding="utf-8") as pid_file:
         pid_file.write(str(os.getpid()))
