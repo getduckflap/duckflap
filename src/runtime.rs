@@ -532,11 +532,45 @@ fn classify_process_group_probe(
 fn signal_group(group: Pid, signal: Signal) -> Result<(), RuntimeError> {
     match kill_process_group(group, signal) {
         Ok(()) | Err(Errno::SRCH) => Ok(()),
-        Err(source) => Err(RuntimeError::SignalProcessGroup {
-            process_group_id: u32::try_from(group.as_raw_pid()).unwrap_or_default(),
-            source,
-        }),
+        Err(source) => {
+            #[cfg(target_os = "macos")]
+            eprintln!("{}", macos_process_group_diagnostic(group, signal, source));
+            Err(RuntimeError::SignalProcessGroup {
+                process_group_id: u32::try_from(group.as_raw_pid()).unwrap_or_default(),
+                source,
+            })
+        }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_diagnostic(group: Pid, signal: Signal, source: Errno) -> String {
+    let group_id = group.as_raw_pid().to_string();
+    let members = Command::new("/bin/ps")
+        .env("LC_ALL", "C")
+        .args(["-axo", "pid=,ppid=,pgid=,sid=,uid=,euid=,stat=,command="])
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.split_whitespace().nth(2) == Some(group_id.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|error| format!("failed to inspect process table: {error}"));
+    // SAFETY: These process identity queries have no preconditions.
+    let (uid, euid, caller_group, caller_session) = unsafe {
+        (
+            libc::getuid(),
+            libc::geteuid(),
+            libc::getpgid(0),
+            libc::getsid(0),
+        )
+    };
+    format!(
+        "duckflap macOS signal diagnostic: caller_pid={} uid={uid} euid={euid} pgid={caller_group} sid={caller_session}; target_pgid={group_id} signal={signal:?} error={source}; target members:\n{members}",
+        process::id(),
+    )
 }
 
 fn wait_for_group_exit(group: Pid, timeout: Duration) -> Result<bool, RuntimeError> {

@@ -1139,6 +1139,14 @@ fn start_web_component(
             .map_err(AppError::from)
             .map_err(|error| CommandFailure::new(error, changed))?
         {
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "duckflap macOS startup diagnostic: runtime pid={} pgid={} exited before readiness with status={status}; log={}",
+                stored_process.pid,
+                stored_process.process_group_id,
+                fs::read_to_string(&stored_process.log_path)
+                    .unwrap_or_else(|error| format!("<failed to read log: {error}>")),
+            );
             terminate_recorded_process_group(&stored_process, session.id, changed)?;
             if let Some(source) = spawned
                 .take_exec_error()
@@ -1173,6 +1181,15 @@ fn start_web_component(
             ready_since = None;
         }
         if Instant::now() >= deadline {
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "duckflap macOS startup diagnostic: runtime pid={} pgid={} timed out waiting for port {}; log={}",
+                stored_process.pid,
+                stored_process.process_group_id,
+                service.port,
+                fs::read_to_string(&stored_process.log_path)
+                    .unwrap_or_else(|error| format!("<failed to read log: {error}>")),
+            );
             terminate_recorded_process_group(&stored_process, session.id, changed)?;
             let _ = spawned.child.wait();
             return Err(CommandFailure::new(
