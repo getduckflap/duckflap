@@ -75,7 +75,13 @@ duckflap release --json
 Once Duckflap is installed, give your coding agent this instruction:
 
 ```text
-Use Duckflap to manage this project's local services. Start them with `duckflap run --detach --json` and discover service URLs and readiness with `duckflap status --json`. If startup fails, use `duckflap doctor --json` and `duckflap logs <service>` to diagnose it. Stop the stack with `duckflap stop --json`. Do not choose ports, edit tracked port configuration, or terminate unknown processes manually.
+Use Duckflap to manage this project's local services.
+
+- Start the stack with `duckflap run --detach --json`.
+- Discover service URLs and readiness with `duckflap status --json`.
+- If startup fails, diagnose it with `duckflap doctor --json` and `duckflap logs <service>`.
+- Stop the stack with `duckflap stop --json`.
+- Do not choose ports, edit tracked port configuration, or terminate unknown processes manually.
 ```
 
 ## Supported projects
